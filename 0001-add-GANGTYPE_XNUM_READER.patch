@@ -1,0 +1,421 @@
+From 312200a6bd1e3341b4069e5c13cb5848eb8e020c Mon Sep 17 00:00:00 2001
+From: Kenan Yao <kyao@pivotal.io>
+Date: Tue, 16 Jun 2015 10:52:14 -0400
+Subject: [PATCH 1/6] add GANGTYPE_XNUM_READER
+
+---
+ cdb-pg/src/backend/cdb/cdbdisp.c         |  39 ------------
+ cdb-pg/src/backend/cdb/cdbgang.c         |  39 +++++-------
+ cdb-pg/src/backend/commands/explain.c    |   1 +
+ cdb-pg/src/backend/executor/execUtils.c  | 104 +++++++++++++++++++++----------
+ cdb-pg/src/backend/executor/nodeMotion.c |   9 ++-
+ cdb-pg/src/include/cdb/cdbgang.h         |   3 +-
+ 6 files changed, 96 insertions(+), 99 deletions(-)
+
+diff --git a/cdb-pg/src/backend/cdb/cdbdisp.c b/cdb-pg/src/backend/cdb/cdbdisp.c
+index b7eecf6..4b96e4a 100644
+--- a/cdb-pg/src/backend/cdb/cdbdisp.c
++++ b/cdb-pg/src/backend/cdb/cdbdisp.c
+@@ -635,14 +635,6 @@ cdbdisp_dispatchToGang(struct CdbDispatcherState *ds,
+ 
+ 		Assert(segdbDesc != NULL);
+ 
+-		if (disp_direct->directed_dispatch)
+-		{
+-			Assert (disp_direct->count == 1); /* currently we allow direct-to-one dispatch, only */
+-
+-			if (disp_direct->content[0] != segdbDesc->segment_database_info->segindex)
+-				continue;
+-		}
+-
+ 		/* Initialize the QE's CdbDispatchResult object. */
+ 		qeResult = cdbdisp_makeResult(dispatchResults, segdbDesc, sliceIndex);
+ 
+@@ -3624,40 +3616,9 @@ cdbdisp_dispatchX(DispatchCommandQueryParms *pQueryParms,
+ 				if (primaryGang == NULL)
+ 					continue;
+ 			}
+-
+-			if (slice->directDispatch.isDirectDispatch)
+-			{
+-				direct.directed_dispatch = true;
+-				direct.count = list_length(slice->directDispatch.contentIds);
+-				Assert(direct.count == 1); /* only support to single content right now.  If this changes then we need to change from a list to another structure to avoid n^2 cases */
+-				direct.content[0] = linitial_int(slice->directDispatch.contentIds);
+-
+-				if (Test_print_direct_dispatch_info)
+-				{
+-					elog(INFO, "Dispatch command to SINGLE content");
+-				}
+-			}
+-			else
+-			{
+-				direct.directed_dispatch = false;
+-				direct.count = 0;
+-
+-				if (Test_print_direct_dispatch_info)
+-				{
+-					elog(INFO, "Dispatch command to ALL contents");
+-				}
+-			}
+ 		}
+ 		else
+ 		{
+-			direct.directed_dispatch = false;
+-			direct.count = 0;
+-
+-			if (Test_print_direct_dispatch_info)
+-			{
+-				elog(INFO, "Dispatch command to ALL contents");
+-			}
+-
+ 			/*
+ 			 *  Non-sliced, used specified gangs
+ 			 */
+diff --git a/cdb-pg/src/backend/cdb/cdbgang.c b/cdb-pg/src/backend/cdb/cdbgang.c
+index e1220ae..d7af82e 100644
+--- a/cdb-pg/src/backend/cdb/cdbgang.c
++++ b/cdb-pg/src/backend/cdb/cdbgang.c
+@@ -739,22 +739,21 @@ buildGangDefinition(GangType type, int gang_id, int size, int content, char *por
+ 	{
+ 		p = &cdb_component_dbs->segment_db_info[i];
+ 
+-		if (type == GANGTYPE_PRIMARY_READER && size == 1) /* handle singleton readers separately */
++		if (type == GANGTYPE_XNUM_READER) /* handle singleton readers separately */
+ 		{
+-			if (size == 1) /* singleton reader */
+-			{
+-				if (content != p->segindex)
+-					continue;
++			Assert(size == 1);
++			if (content != p->segindex || !SEGMENT_IS_ACTIVE_PRIMARY(p))
++				continue;
+ 
+-				/* Got our singleton */
+-				segdbDesc = &newGangDefinition->db_descriptors[seg_count];
+-				cdbconn_initSegmentDescriptor(segdbDesc, p);
+-				seg_count++;
+-				break;
+-			}
++			/* Got our singleton */
++			segdbDesc = &newGangDefinition->db_descriptors[seg_count];
++			cdbconn_initSegmentDescriptor(segdbDesc, p);
++			seg_count++;
++			break;
+ 		}
+ 		else /* GANGTYPE_PRIMARY_WRITER or (GANGTYPE_PRIMARY_READER AND N-READER) */
+ 		{
++			Assert(size == getgpsegmentCount());
+ 			if (SEGMENT_IS_ACTIVE_PRIMARY(p))
+ 			{
+ 				segdbDesc = &newGangDefinition->db_descriptors[seg_count];
+@@ -1397,14 +1396,8 @@ allocateGang(GangType type, int size, int content, char *portal_name)
+ 	{
+ 
+ 		case GANGTYPE_PRIMARY_READER:
+-		case GANGTYPE_ENTRYDB_READER:
+-			/*
+-			 * Must be size 1 or size numsegments
+-			 * If size 1, then content tells us which segment we want
+-			 */
+-			if (size != 1)
+ 			{
+-				Assert(type == GANGTYPE_PRIMARY_READER);
++				Assert(size != 1);
+ 				if (availableReaderGangsN != NIL)		/* There are gangs
+ 														 * already created */
+ 				{
+@@ -1456,14 +1449,12 @@ allocateGang(GangType type, int size, int content, char *portal_name)
+ 				}
+ 
+ 				allocatedReaderGangsN = lappend(allocatedReaderGangsN, gp);
+-
+ 			}
+-			else
+-				/*
+-				 * size 1 gangs
+-				 */
+-			{
++			break;
+ 
++		case GANGTYPE_ENTRYDB_READER:
++		case GANGTYPE_XNUM_READER:
++			{
+ 				if (availableReaderGangs1 != NIL)		/* There are gangs
+ 														 * already created */
+ 				{
+diff --git a/cdb-pg/src/backend/commands/explain.c b/cdb-pg/src/backend/commands/explain.c
+index 133ee97..b0b0add 100644
+--- a/cdb-pg/src/backend/commands/explain.c
++++ b/cdb-pg/src/backend/commands/explain.c
+@@ -863,6 +863,7 @@ appendGangAndDirectDispatchInfo(StringInfo str, PlanState *planstate, int sliceI
+ 
+ 		case GANGTYPE_PRIMARY_WRITER:
+ 		case GANGTYPE_PRIMARY_READER:
++		case GANGTYPE_XNUM_READER:
+ 		{
+ 			int numSegments;
+ 			appendStringInfo(str, "  (slice%d;", sliceId);
+diff --git a/cdb-pg/src/backend/executor/execUtils.c b/cdb-pg/src/backend/executor/execUtils.c
+index 33ddd63..eea9f1f 100644
+--- a/cdb-pg/src/backend/executor/execUtils.c
++++ b/cdb-pg/src/backend/executor/execUtils.c
+@@ -1670,11 +1670,14 @@ sliceCalculateNumSendingProcesses(Slice *slice, int numSegmentsInCluster)
+ 			return 0; /* writers don't send */
+ 
+ 		case GANGTYPE_PRIMARY_READER:
++		case GANGTYPE_XNUM_READER:
++		{
+ 			if ( is1GangSlice(slice))
+ 				return 1;
+ 			else if ( slice->directDispatch.isDirectDispatch)
+ 				return list_length(slice->directDispatch.contentIds);
+ 			else return getgpsegmentCount();
++		}
+ 
+ 		default:
+ 			Insist(false);
+@@ -1768,16 +1771,15 @@ InitRootSlices(QueryDesc *queryDesc)
+ typedef struct SliceReq
+ {
+ 	int			numNgangs;
+-	int			num1gangs_primary_reader;
+     int         num1gangs_entrydb_reader;
+ 	int			nxtNgang;
+-	int			nxt1gang_primary_reader;
+ 	int			nxt1gang_entrydb_reader;
+ 	Gang	  **vecNgangs;
+-	Gang	  **vec1gangs_primary_reader;
++	Gang	 ***vec1gangs_primary_reader;
+ 	Gang	  **vec1gangs_entrydb_reader;
+ 	bool		writer;
+-
++	int		   *num1gangs_reader_num_per_seg;
++	bool		has_xnum_reader_gang;
+ }	SliceReq;
+ 
+ /* Forward declarations */
+@@ -1819,7 +1821,8 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 	ListCell   *cell;
+ 	Slice	   *slice;
+ 	int			i,
+-				nslices;
++				nslices,
++				segment_count = getgpsegmentCount();
+ 	Slice	  **sliceMap;
+ 	SliceReq	req,
+ 				inv;
+@@ -1869,16 +1872,22 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 			}
+ 			else
+ 			{
+-				inv.vecNgangs[i] = allocateGang(GANGTYPE_PRIMARY_READER, getgpsegmentCount(), 0, queryDesc->portal_name);
++				inv.vecNgangs[i] = allocateGang(GANGTYPE_PRIMARY_READER, segment_count, 0, queryDesc->portal_name);
+ 			}
+ 		}
+ 	}
+-	if (inv.num1gangs_primary_reader > 0)
++	if (inv.has_xnum_reader_gang)
+ 	{
+-		inv.vec1gangs_primary_reader = (Gang **) palloc(sizeof(Gang *) * inv.num1gangs_primary_reader);
+-		for (i = 0; i < inv.num1gangs_primary_reader; i++)
++		inv.vec1gangs_primary_reader = (Gang ***) palloc0(sizeof(Gang **) * segment_count);
++		for (i = 0; i < segment_count; i++)
+ 		{
+-			inv.vec1gangs_primary_reader[i] = allocateGang(GANGTYPE_PRIMARY_READER, 1, utility_segment_index, queryDesc->portal_name);
++			int num = inv.num1gangs_reader_num_per_seg[i];
++			inv.vec1gangs_primary_reader[i] = (Gang **) palloc(sizeof(Gang *) * num);
++			int j;
++			for (j = 0; j < num; ++j)
++			{
++				inv.vec1gangs_primary_reader[i][j] = allocateGang(GANGTYPE_XNUM_READER, 1, i, queryDesc->portal_name);
++			}
+ 		}
+ 	}
+ 	if (inv.num1gangs_entrydb_reader > 0)
+@@ -1893,15 +1902,15 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 	/* Use the gangs to construct the CdbProcess lists in slices. */
+ 
+ 	inv.nxtNgang = 0;
+-    inv.nxt1gang_primary_reader = 0;
+     inv.nxt1gang_entrydb_reader = 0;
++	memset(inv.num1gangs_reader_num_per_seg, 0, sizeof(int) * segment_count);
+ 	AssociateSlicesToProcesses(sliceMap, 0, &inv);		/* Main tree. */
+ 
+ 	for (i = sliceTable->nMotions + 1; i < nslices; i++)
+ 	{
+ 		inv.nxtNgang = 0;
+-        inv.nxt1gang_primary_reader = 0;
+         inv.nxt1gang_entrydb_reader = 0;
++		memset(inv.num1gangs_reader_num_per_seg, 0, sizeof(int) * segment_count);
+ 		AssociateSlicesToProcesses(sliceMap, i, &inv);	/* An initPlan */
+ 	}
+ 
+@@ -1910,10 +1919,18 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 	if (inv.vecNgangs != NULL)
+ 		pfree(inv.vecNgangs);
+ 	if (inv.vec1gangs_primary_reader != NULL)
++	{
++		for (i = 0; i < segment_count; ++i)
++		{
++			if (inv.vec1gangs_primary_reader[i] != NULL)
++			{
++				pfree(inv.vec1gangs_primary_reader[i]);
++			}
++		}
+ 		pfree(inv.vec1gangs_primary_reader);
++	}
+ 	if (inv.vec1gangs_entrydb_reader != NULL)
+ 		pfree(inv.vec1gangs_entrydb_reader);
+-
+ }
+ 
+ void
+@@ -1929,21 +1946,30 @@ void
+ InitSliceReq(SliceReq * req)
+ {
+ 	req->numNgangs = 0;
+-    req->num1gangs_primary_reader = 0;
+     req->num1gangs_entrydb_reader = 0;
+ 	req->writer = FALSE;
+ 	req->vecNgangs = NULL;
+ 	req->vec1gangs_primary_reader = NULL;
+ 	req->vec1gangs_entrydb_reader = NULL;
++	req->num1gangs_reader_num_per_seg = palloc0(sizeof(int) * getgpsegmentCount());;
++	req->has_xnum_reader_gang = false;
+ }
+ 
+ void
+ AccumSliceReq(SliceReq * inv, SliceReq * req)
+ {
+ 	inv->numNgangs = Max(inv->numNgangs, req->numNgangs);
+-	inv->num1gangs_primary_reader = Max(inv->num1gangs_primary_reader, req->num1gangs_primary_reader);
+ 	inv->num1gangs_entrydb_reader = Max(inv->num1gangs_entrydb_reader, req->num1gangs_entrydb_reader);
+ 	inv->writer = (inv->writer || req->writer);
++	inv->has_xnum_reader_gang = (inv->has_xnum_reader_gang | req->has_xnum_reader_gang);
++	if (!inv->has_xnum_reader_gang)
++		return;
++	int i;
++	for (i = 0; i < getgpsegmentCount(); ++i)
++	{
++		inv->num1gangs_reader_num_per_seg[i] = Max(inv->num1gangs_reader_num_per_seg[i],
++												   req->num1gangs_reader_num_per_seg[i]);
++	}
+ }
+ 
+ 
+@@ -1974,16 +2000,20 @@ InventorySliceTree(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+ 			req->writer = TRUE;
+ 			/* fall through */
+ 		case GANGTYPE_PRIMARY_READER:
+-			if (is1GangSlice(slice))
+-			{
+-				req->num1gangs_primary_reader++;
+-			}
+-			else
++			Assert(slice->gangSize == getgpsegmentCount());
++			req->numNgangs++;
++			break;
++		case GANGTYPE_XNUM_READER:
+ 			{
+-				Assert(slice->gangSize == getgpsegmentCount());
+-				req->numNgangs++;
++				req->has_xnum_reader_gang = true;
++				Assert(slice->gangSize == 1); /* currently, direct dispatch only supports one segdb dispatch */
++				Assert(slice->directDispatch.isDirectDispatch);
++				Assert(list_length(slice->directDispatch.contentIds) == 1);
++				int content_id = linitial_int(slice->directDispatch.contentIds);
++				Assert(content_id >= 0 && content_id < getgpsegmentCount());
++				req->num1gangs_reader_num_per_seg[content_id]++;
++				break;
+ 			}
+-			break;
+ 	}
+ 
+ 	foreach(cell, slice->children)
+@@ -2055,17 +2085,9 @@ AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+ 			break;
+ 
+ 		case GANGTYPE_PRIMARY_READER:
+-			if (is1GangSlice(slice))
+-			{
+-				slice->primaryGang = req->vec1gangs_primary_reader[req->nxt1gang_primary_reader];
+-				req->nxt1gang_primary_reader++;
+-			}
+-			else
+-			{
+-				Assert(slice->gangSize == getgpsegmentCount());
+-				slice->primaryGang = req->vecNgangs[req->nxtNgang];
+-				req->nxtNgang++;
+-			}
++			Assert(slice->gangSize == getgpsegmentCount());
++			slice->primaryGang = req->vecNgangs[req->nxtNgang];
++			req->nxtNgang++;
+ 			Assert(slice->primaryGang != NULL);
+ 			slice->primary_gang_id = slice->primaryGang->gang_id;
+ 			slice->primaryProcesses = getCdbProcessList(slice->primaryGang,
+@@ -2073,6 +2095,20 @@ AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+                                                         &slice->directDispatch);
+ 			Assert(sliceCalculateNumSendingProcesses(slice, getgpsegmentCount()) == countNonNullValues(slice->primaryProcesses));
+ 			break;
++		case GANGTYPE_XNUM_READER:
++			Assert(slice->gangSize == 1);
++			Assert(slice->directDispatch.isDirectDispatch);
++			Assert(list_length(slice->directDispatch.contentIds) == 1);
++			int content_id = linitial_int(slice->directDispatch.contentIds);
++			slice->primaryGang = req->vec1gangs_primary_reader[content_id][req->num1gangs_reader_num_per_seg[content_id]];
++			req->num1gangs_reader_num_per_seg[content_id]++;
++			Assert(slice->primaryGang != NULL);
++			slice->primary_gang_id = slice->primaryGang->gang_id;
++			slice->primaryProcesses = getCdbProcessList(slice->primaryGang,
++														slice->sliceIndex,
++														&slice->directDispatch);
++			Assert(sliceCalculateNumSendingProcesses(slice, getgpsegmentCount()) == 1 && countNonNullValues(slice->primaryProcesses) == 1);
++			break;
+ 	}
+ 
+ 	foreach(cell, slice->children)
+diff --git a/cdb-pg/src/backend/executor/nodeMotion.c b/cdb-pg/src/backend/executor/nodeMotion.c
+index 3c74c9e..1f8c793 100644
+--- a/cdb-pg/src/backend/executor/nodeMotion.c
++++ b/cdb-pg/src/backend/executor/nodeMotion.c
+@@ -1005,6 +1005,12 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
+             sendFlow->segindex == -1)
+             sendSlice->gangType = GANGTYPE_ENTRYDB_READER;
+ 
++		if (sendSlice->directDispatch.isDirectDispatch)
++		{
++			sendSlice->gangType = GANGTYPE_XNUM_READER;
++			sendSlice->gangSize = list_length(sendSlice->directDispatch.contentIds);
++		}
++
+         sendSlice->numGangMembersToBeActive = sliceCalculateNumSendingProcesses(sendSlice, getgpsegmentCount());
+ 
+ 		if (node->motionType == MOTIONTYPE_FIXED && node->numOutputSegs == 1)
+@@ -1021,7 +1027,8 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
+ 				Assert(recvSlice->gangSize == 1);
+ 				Assert(node->outputSegIdx[0] >= 0
+ 					   ? (recvSlice->gangType == GANGTYPE_PRIMARY_READER || 
+-						  recvSlice->gangType == GANGTYPE_ENTRYDB_READER)
++						  recvSlice->gangType == GANGTYPE_ENTRYDB_READER ||
++						  recvSlice->gangType == GANGTYPE_XNUM_READER)
+ 					   : recvSlice->gangType == GANGTYPE_ENTRYDB_READER);
+ 			}
+ 		}
+diff --git a/cdb-pg/src/include/cdb/cdbgang.h b/cdb-pg/src/include/cdb/cdbgang.h
+index b52f73c..9ac221e 100644
+--- a/cdb-pg/src/include/cdb/cdbgang.h
++++ b/cdb-pg/src/include/cdb/cdbgang.h
+@@ -25,7 +25,8 @@ typedef enum GangType
+ 	GANGTYPE_UNALLOCATED,       /* a root slice executed by the qDisp */
+ 	GANGTYPE_ENTRYDB_READER,    /* a 1-gang with read access to the entry db */
+ 	GANGTYPE_PRIMARY_READER,    /* a 1-gang or N-gang to read the segment dbs */
+-	GANGTYPE_PRIMARY_WRITER    /* the N-gang that can update the segment dbs */
++	GANGTYPE_PRIMARY_WRITER,    /* the N-gang that can update the segment dbs */
++	GANGTYPE_XNUM_READER
+ } GangType;
+ 
+ /*
+-- 
+1.8.2.1
+

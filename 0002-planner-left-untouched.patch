@@ -1,0 +1,222 @@
+From 34cf1429811199ebb547b8bde67a9faf15271997 Mon Sep 17 00:00:00 2001
+From: Kenan Yao <kyao@pivotal.io>
+Date: Mon, 22 Jun 2015 11:13:41 -0400
+Subject: [PATCH 2/6] planner left untouched.
+
+---
+ cdb-pg/src/backend/cdb/cdbdisp.c         | 39 ++++++++++++++++++++
+ cdb-pg/src/backend/executor/execUtils.c  | 62 +++++++++++++++++++++-----------
+ cdb-pg/src/backend/executor/nodeMotion.c |  5 +++
+ cdb-pg/src/include/cdb/cdbgang.h         |  4 +--
+ 4 files changed, 87 insertions(+), 23 deletions(-)
+
+diff --git a/cdb-pg/src/backend/cdb/cdbdisp.c b/cdb-pg/src/backend/cdb/cdbdisp.c
+index 4b96e4a..9d36822 100644
+--- a/cdb-pg/src/backend/cdb/cdbdisp.c
++++ b/cdb-pg/src/backend/cdb/cdbdisp.c
+@@ -635,6 +635,14 @@ cdbdisp_dispatchToGang(struct CdbDispatcherState *ds,
+ 
+ 		Assert(segdbDesc != NULL);
+ 
++		if (disp_direct->directed_dispatch)
++		{
++			Assert (disp_direct->count == 1); /* currently we allow direct-to-one dispatch, only */
++
++			if (disp_direct->content[0] != segdbDesc->segment_database_info->segindex)
++				continue;
++		}
++
+ 		/* Initialize the QE's CdbDispatchResult object. */
+ 		qeResult = cdbdisp_makeResult(dispatchResults, segdbDesc, sliceIndex);
+ 
+@@ -3616,9 +3624,40 @@ cdbdisp_dispatchX(DispatchCommandQueryParms *pQueryParms,
+ 				if (primaryGang == NULL)
+ 					continue;
+ 			}
++
++			if (slice->directDispatch.isDirectDispatch)
++            {
++                direct.directed_dispatch = true;
++                direct.count = list_length(slice->directDispatch.contentIds);
++                Assert(direct.count == 1); /* only support to single content right now.  If this changes then we need to change from a list to another structure to avoid n^2 cases */
++                direct.content[0] = linitial_int(slice->directDispatch.contentIds);
++
++                if (Test_print_direct_dispatch_info)
++                {
++                    elog(INFO, "Dispatch command to SINGLE content");
++                }
++            }
++            else
++            {
++                direct.directed_dispatch = false;
++                direct.count = 0;
++
++                if (Test_print_direct_dispatch_info)
++                {
++                    elog(INFO, "Dispatch command to ALL contents");
++                }
++            }
+ 		}
+ 		else
+ 		{
++			direct.directed_dispatch = false;
++			direct.count = 0;
++
++			if (Test_print_direct_dispatch_info)
++			{
++				elog(INFO, "Dispatch command to ALL contents");
++			}
++
+ 			/*
+ 			 *  Non-sliced, used specified gangs
+ 			 */
+diff --git a/cdb-pg/src/backend/executor/execUtils.c b/cdb-pg/src/backend/executor/execUtils.c
+index eea9f1f..0bab6b2 100644
+--- a/cdb-pg/src/backend/executor/execUtils.c
++++ b/cdb-pg/src/backend/executor/execUtils.c
+@@ -1558,12 +1558,6 @@ ExecGetShareNodeEntry(EState* estate, int shareidx, bool fCreate)
+  * ----------------------------------------------------------------
+  */
+ 
+-static bool
+-is1GangSlice(Slice *slice)
+-{
+-	return slice->gangSize == 1 && getgpsegmentCount() != 1;
+-}
+-
+ /* Attach a slice table to the given Estate structure.	It should
+  * consist of blank slices, one for the root plan, one for each
+  * Motion node (which roots a slice with a send node), and one for
+@@ -1670,14 +1664,15 @@ sliceCalculateNumSendingProcesses(Slice *slice, int numSegmentsInCluster)
+ 			return 0; /* writers don't send */
+ 
+ 		case GANGTYPE_PRIMARY_READER:
+-		case GANGTYPE_XNUM_READER:
+-		{
+-			if ( is1GangSlice(slice))
++			if (slice->directDispatch.isDirectDispatch)
++			{
++				Assert(list_length(slice->directDispatch.contentIds) == 1);
+ 				return 1;
+-			else if ( slice->directDispatch.isDirectDispatch)
+-				return list_length(slice->directDispatch.contentIds);
+-			else return getgpsegmentCount();
+-		}
++			}
++			return getgpsegmentCount();
++
++		case GANGTYPE_XNUM_READER:
++			return 1;
+ 
+ 		default:
+ 			Insist(false);
+@@ -1826,6 +1821,7 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 	Slice	  **sliceMap;
+ 	SliceReq	req,
+ 				inv;
++	bool allocated_writer_gang = false;
+ 
+ 	/* Make a map so we can access slices quickly by index.  */
+ 	nslices = list_length(sliceTable->slices);
+@@ -1867,6 +1863,7 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 			if (i == 0 && !queryDesc->extended_query)
+ 			{
+ 				inv.vecNgangs[i] = allocateWriterGang();
++				allocated_writer_gang = true;
+ 
+ 				Assert(inv.vecNgangs[i] != NULL);
+ 			}
+@@ -1886,7 +1883,14 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 			int j;
+ 			for (j = 0; j < num; ++j)
+ 			{
+-				inv.vec1gangs_primary_reader[i][j] = allocateGang(GANGTYPE_XNUM_READER, 1, i, queryDesc->portal_name);
++				if (!allocated_writer_gang && !queryDesc->extended_query)
++				{
++					inv.vec1gangs_primary_reader[i][j] = allocateWriterGang();
++				}
++				else
++				{
++					inv.vec1gangs_primary_reader[i][j] = allocateGang(GANGTYPE_XNUM_READER, 1, i, queryDesc->portal_name);
++				}
+ 			}
+ 		}
+ 	}
+@@ -2007,10 +2011,18 @@ InventorySliceTree(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+ 			{
+ 				req->has_xnum_reader_gang = true;
+ 				Assert(slice->gangSize == 1); /* currently, direct dispatch only supports one segdb dispatch */
+-				Assert(slice->directDispatch.isDirectDispatch);
+-				Assert(list_length(slice->directDispatch.contentIds) == 1);
+-				int content_id = linitial_int(slice->directDispatch.contentIds);
+-				Assert(content_id >= 0 && content_id < getgpsegmentCount());
++				int content_id = -1;
++				if (slice->directDispatch.isDirectDispatch)
++				{
++					Assert(list_length(slice->directDispatch.contentIds) == 1);
++					content_id = linitial_int(slice->directDispatch.contentIds);
++					Assert(content_id >= 0 && content_id < getgpsegmentCount());
++				}
++				else /* previous 1-size primary writer gang, randomly assign a segment to do the work */
++					/* TODO: could be optimized here */
++				{
++					content_id = gp_singleton_segindex;
++				}
+ 				req->num1gangs_reader_num_per_seg[content_id]++;
+ 				break;
+ 			}
+@@ -2097,9 +2109,17 @@ AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+ 			break;
+ 		case GANGTYPE_XNUM_READER:
+ 			Assert(slice->gangSize == 1);
+-			Assert(slice->directDispatch.isDirectDispatch);
+-			Assert(list_length(slice->directDispatch.contentIds) == 1);
+-			int content_id = linitial_int(slice->directDispatch.contentIds);
++			int content_id = -1;
++			if (slice->directDispatch.isDirectDispatch)
++			{
++				Assert(list_length(slice->directDispatch.contentIds) == 1);
++				content_id = linitial_int(slice->directDispatch.contentIds);
++			}
++			else
++			{
++				content_id = gp_singleton_segindex;
++			}
++			Assert(content_id >= 0);
+ 			slice->primaryGang = req->vec1gangs_primary_reader[content_id][req->num1gangs_reader_num_per_seg[content_id]];
+ 			req->num1gangs_reader_num_per_seg[content_id]++;
+ 			Assert(slice->primaryGang != NULL);
+diff --git a/cdb-pg/src/backend/executor/nodeMotion.c b/cdb-pg/src/backend/executor/nodeMotion.c
+index 1f8c793..f3a4401 100644
+--- a/cdb-pg/src/backend/executor/nodeMotion.c
++++ b/cdb-pg/src/backend/executor/nodeMotion.c
+@@ -1011,6 +1011,11 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
+ 			sendSlice->gangSize = list_length(sendSlice->directDispatch.contentIds);
+ 		}
+ 
++		if (sendSlice->gangSize == 1 && getgpsegmentCount() != 1)
++		{
++			sendSlice->gangType = GANGTYPE_XNUM_READER;
++		}
++
+         sendSlice->numGangMembersToBeActive = sliceCalculateNumSendingProcesses(sendSlice, getgpsegmentCount());
+ 
+ 		if (node->motionType == MOTIONTYPE_FIXED && node->numOutputSegs == 1)
+diff --git a/cdb-pg/src/include/cdb/cdbgang.h b/cdb-pg/src/include/cdb/cdbgang.h
+index 9ac221e..65ede5c 100644
+--- a/cdb-pg/src/include/cdb/cdbgang.h
++++ b/cdb-pg/src/include/cdb/cdbgang.h
+@@ -25,8 +25,8 @@ typedef enum GangType
+ 	GANGTYPE_UNALLOCATED,       /* a root slice executed by the qDisp */
+ 	GANGTYPE_ENTRYDB_READER,    /* a 1-gang with read access to the entry db */
+ 	GANGTYPE_PRIMARY_READER,    /* a 1-gang or N-gang to read the segment dbs */
+-	GANGTYPE_PRIMARY_WRITER,    /* the N-gang that can update the segment dbs */
+-	GANGTYPE_XNUM_READER
++	GANGTYPE_XNUM_READER,
++	GANGTYPE_PRIMARY_WRITER    /* the N-gang that can update the segment dbs */
+ } GangType;
+ 
+ /*
+-- 
+1.8.2.1
+

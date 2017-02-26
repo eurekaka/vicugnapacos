@@ -1,0 +1,172 @@
+From 665c56e1bc8a2ee11c6019aa170dc2c1a8dd2acb Mon Sep 17 00:00:00 2001
+From: Kenan Yao <kyao@pivotal.io>
+Date: Mon, 20 Jul 2015 10:44:07 -0400
+Subject: [PATCH 5/6] modify cdbdisp_dispatchCommandToAllGangs, not allocating
+ writer gang, but to all existing gangs.
+
+---
+ cdb-pg/src/backend/cdb/cdbdisp.c | 67 ++++++++++++++++++++++++++++++++++------
+ cdb-pg/src/backend/cdb/cdbgang.c | 19 ++++++++++++
+ cdb-pg/src/include/cdb/cdbgang.h |  2 ++
+ 3 files changed, 78 insertions(+), 10 deletions(-)
+
+diff --git a/cdb-pg/src/backend/cdb/cdbdisp.c b/cdb-pg/src/backend/cdb/cdbdisp.c
+index 7fa1d3f..82393bb 100644
+--- a/cdb-pg/src/backend/cdb/cdbdisp.c
++++ b/cdb-pg/src/backend/cdb/cdbdisp.c
+@@ -1343,6 +1343,7 @@ cdbdisp_dispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
+ 
+ 	ds.primaryResults = cdbdisp_makeDispatchResults(nsegdb, 0, /* cancelOnError */ false);
+ 
++	Assert(primaryGang->type == GANGTYPE_PRIMARY_WRITER || primaryGang->type == GANGTYPE_XNUM_WRITER);
+ 	ds.primaryResults->writer_gang = primaryGang;
+ 
+ 	cdbdisp_dispatchToGang(&ds, GP_DISPATCH_COMMAND_TYPE_DTX_PROTOCOL,
+@@ -1673,9 +1674,10 @@ cdbdisp_dispatchCommandToAllGangs(const char	*strCommand,
+ {
+ 	DispatchCommandQueryParms queryParms;
+ 	
+-	Gang		*primaryGang;
+-    List		*readerGangs;
+-    ListCell	*le;
++	Gang		*primaryGang = NULL;
++    List		*readerGangs = NIL;
++	List		*xnumWriterGangs = NIL;
++    ListCell	*le = NULL;
+ 
+     int			nsegdb = getgpsegmentCount();
+ 	int			gangCount;
+@@ -1693,11 +1695,26 @@ cdbdisp_dispatchCommandToAllGangs(const char	*strCommand,
+ 	/*
+ 	 * Allocate a primary QE for every available segDB in the system.
+ 	 */
+-	primaryGang = allocateWriterGang();
++	xnumWriterGangs = getAllXnumWriterGangs();
+ 
+-	Assert(primaryGang);
++	if (xnumWriterGangs == NIL)
++	{
++		primaryGang = allocateWriterGang();
++	}
++
++	Assert(primaryGang != NULL || xnumWriterGangs != NIL);
+ 	
+-	queryParms.primary_gang_id = primaryGang->gang_id;
++	if (primaryGang != NULL)
++	{
++		queryParms.primary_gang_id = primaryGang->gang_id;
++	}
++	else
++	{
++		/* dispatch agent is disabled now, here just randomly pick a gang id,
++		 * since it does not matter */
++		Assert(xnumWriterGangs != NIL);
++		queryParms.primary_gang_id = ((Gang *) linitial(xnumWriterGangs))->gang_id;
++	}
+ 
+ 	/* serialized a version of our snapshot */
+ 	queryParms.serializedDtxContextInfo = 
+@@ -1709,15 +1726,45 @@ cdbdisp_dispatchCommandToAllGangs(const char	*strCommand,
+ 	/*
+ 	 * Dispatch the command.
+ 	 */
+-	gangCount = 1 + list_length(readerGangs);
++	if (primaryGang != NULL)
++	{
++		gangCount = 1 + list_length(readerGangs);
++	}
++	else
++	{
++		Assert(xnumWriterGangs != NIL);
++		gangCount = list_length(xnumWriterGangs) + list_length(readerGangs);
++	}
+ 	ds->primaryResults = cdbdisp_makeDispatchResults(nsegdb * gangCount, 0, cancelOnError);
+ 
+-	ds->primaryResults->writer_gang = primaryGang;
+-	cdbdisp_dispatchToGang(ds,
++	/* if primaryGang is NULL, then we do not check the xnum writer gangs to be idle in
++	 * cdbdisp_dispatchToGang, because it would be duplicately called in SET
++	 * command */
++	ds->primaryResults->writer_gang = NULL;
++	if (primaryGang != NULL)
++	{
++		Assert(primaryGang->type == GANGTYPE_PRIMARY_WRITER);
++		ds->primaryResults->writer_gang = primaryGang;
++		cdbdisp_dispatchToGang(ds,
+ 						   GP_DISPATCH_COMMAND_TYPE_QUERY,
+ 						   &queryParms,
+ 						   primaryGang, -1, gangCount, DEFAULT_DISP_DIRECT);
++	}
++	else
++	{
++		foreach(le, xnumWriterGangs)
++		{
++			Gang *wg = lfirst(le);
++			Assert(wg->type == GANGTYPE_XNUM_WRITER);
++			ds->primaryResults->writer_gang = wg;
++			cdbdisp_dispatchToGang(ds,
++								   GP_DISPATCH_COMMAND_TYPE_QUERY,
++								   &queryParms,
++								   wg, -1, gangCount, DEFAULT_DISP_DIRECT);
++		}
++	}
+ 
++	ds->primaryResults->writer_gang = NULL;
+ 	foreach(le, readerGangs)
+ 	{
+ 		Gang  *rg = lfirst(le);
+@@ -3696,7 +3743,7 @@ cdbdisp_dispatchX(DispatchCommandQueryParms *pQueryParms,
+ 		 */
+ 		if (primaryGang != NULL)
+ 		{
+-			if (primaryGang->type == GANGTYPE_PRIMARY_WRITER)
++			if (primaryGang->type == GANGTYPE_PRIMARY_WRITER || primaryGang->type == GANGTYPE_XNUM_WRITER)
+ 				ds->primaryResults->writer_gang = primaryGang;
+ 
+ 			cdbdisp_dispatchToGang(ds,
+diff --git a/cdb-pg/src/backend/cdb/cdbgang.c b/cdb-pg/src/backend/cdb/cdbgang.c
+index f41a24c..5bc1c09 100644
+--- a/cdb-pg/src/backend/cdb/cdbgang.c
++++ b/cdb-pg/src/backend/cdb/cdbgang.c
+@@ -1310,6 +1310,25 @@ static Gang *primaryWriterGang = NULL;
+ static Gang **availableXnumWriterGangs = NULL;
+ 
+ List *
++getAllXnumWriterGangs()
++{
++	List *res = NIL;
++	if (availableXnumWriterGangs == NULL)
++	{
++		return res;
++	}
++
++	for (int i = 0; i < getgpsegmentCount(); ++i)
++	{
++		if (availableXnumWriterGangs[i] != NULL)
++		{
++			res = lappend(res, availableXnumWriterGangs[i]);
++		}
++	}
++	return res;
++}
++
++List *
+ getAllReaderGangs()
+ {
+ 	List	   *res = NIL;
+diff --git a/cdb-pg/src/include/cdb/cdbgang.h b/cdb-pg/src/include/cdb/cdbgang.h
+index 30163ff..426081a 100644
+--- a/cdb-pg/src/include/cdb/cdbgang.h
++++ b/cdb-pg/src/include/cdb/cdbgang.h
+@@ -79,6 +79,8 @@ extern void CheckForResetSession(void);
+ 
+ extern List * getAllReaderGangs(void);
+ 
++extern List *getAllXnumWriterGangs(void);
++
+ extern void detectFailedConnections(void);
+ 
+ extern CdbComponentDatabases *getComponentDatabases(void);
+-- 
+1.8.2.1
+

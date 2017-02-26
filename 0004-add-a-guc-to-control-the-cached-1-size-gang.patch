@@ -1,0 +1,83 @@
+From 5f24424ac9c008bb0e43d928037cabcbcc4ff9fd Mon Sep 17 00:00:00 2001
+From: Kenan Yao <kyao@pivotal.io>
+Date: Thu, 16 Jul 2015 05:42:31 -0400
+Subject: [PATCH 4/6] add a guc to control the cached 1-size gang.
+
+---
+ cdb-pg/src/backend/cdb/cdbgang.c    |  3 +--
+ cdb-pg/src/backend/cdb/cdbvars.c    |  2 ++
+ cdb-pg/src/backend/utils/misc/guc.c | 10 +++++++++-
+ cdb-pg/src/include/cdb/cdbvars.h    |  1 +
+ 4 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/cdb-pg/src/backend/cdb/cdbgang.c b/cdb-pg/src/backend/cdb/cdbgang.c
+index 36bfb54..f41a24c 100644
+--- a/cdb-pg/src/backend/cdb/cdbgang.c
++++ b/cdb-pg/src/backend/cdb/cdbgang.c
+@@ -47,7 +47,6 @@ extern char *default_tablespace;
+ #include "utils/guc_tables.h"
+ 
+ 
+-#define MAX_CACHED_1_GANGS 1
+ /*
+  *	thread_DoConnect is the thread proc used to perform the connection to one of the qExecs.
+  */
+@@ -2324,7 +2323,7 @@ cleanupPortalGangs(Portal portal)
+ 		oldContext = MemoryContextSwitchTo(TopMemoryContext);
+ 
+ 	availableReaderGangsN = cleanupPortalGangList(availableReaderGangsN, gp_cached_gang_threshold);
+-	availableReaderGangs1 = cleanupPortalGangList(availableReaderGangs1, MAX_CACHED_1_GANGS);
++	availableReaderGangs1 = cleanupPortalGangList(availableReaderGangs1, gp_cached_1gang_threshold);
+ 
+ 	elog(DEBUG4, "cleanupPortalGangs '%s'. Reader gang inventory: "
+ 		 "allocatedN=%d availableN=%d allocated1=%d available1=%d",
+diff --git a/cdb-pg/src/backend/cdb/cdbvars.c b/cdb-pg/src/backend/cdb/cdbvars.c
+index cd1bc79..84e3ed2 100644
+--- a/cdb-pg/src/backend/cdb/cdbvars.c
++++ b/cdb-pg/src/backend/cdb/cdbvars.c
+@@ -89,6 +89,8 @@ int			gp_connections_per_thread; /* How many libpq connections are
+ 
+ int			gp_cached_gang_threshold; /*How many gangs to keep around from stmt to stmt.*/
+ 
++int 		gp_cached_1gang_threshold;
++
+ int			Gp_segment = UNDEF_SEGMENT;		/* What content this QE is
+ 												 * handling. */
+ 
+diff --git a/cdb-pg/src/backend/utils/misc/guc.c b/cdb-pg/src/backend/utils/misc/guc.c
+index ae6a88a..f097444 100644
+--- a/cdb-pg/src/backend/utils/misc/guc.c
++++ b/cdb-pg/src/backend/utils/misc/guc.c
+@@ -5591,8 +5591,16 @@ static struct config_int ConfigureNamesInt[] =
+ 		},
+ 		&gp_cached_gang_threshold,
+ 		5, 0, INT_MAX, NULL, NULL
++	},
++	{
++		{"gp_cached_direct_segworker_threshold", PGC_USERSET, GP_ARRAY_TUNING,
++			gettext_noop("Sets the maximum number of 1-size segment worker to cache between statements."),
++			NULL,
++			GUC_NOT_IN_SAMPLE
+ 		},
+-
++		&gp_cached_1gang_threshold,
++		5, 0, INT_MAX, NULL, NULL
++	},
+ 
+ 	{
+ #ifdef USE_ASSERT_CHECKING
+diff --git a/cdb-pg/src/include/cdb/cdbvars.h b/cdb-pg/src/include/cdb/cdbvars.h
+index c3e2230..0b97886 100644
+--- a/cdb-pg/src/include/cdb/cdbvars.h
++++ b/cdb-pg/src/include/cdb/cdbvars.h
+@@ -184,6 +184,7 @@ extern bool gp_use_dispatch_agent;
+ 
+ /*How many gangs to keep around from stmt to stmt.*/
+ extern int			gp_cached_gang_threshold;
++extern int			gp_cached_1gang_threshold;
+ 
+ /*
+  * gp_reject_percent_threshold
+-- 
+1.8.2.1
+

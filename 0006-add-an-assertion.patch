@@ -1,0 +1,24 @@
+From 7edab6f80e2020fad5e1cb95763cdb737c7217cb Mon Sep 17 00:00:00 2001
+From: Kenan Yao <kyao@pivotal.io>
+Date: Mon, 20 Jul 2015 12:01:44 -0400
+Subject: [PATCH 6/6] add an assertion.
+
+---
+ cdb-pg/src/backend/executor/execUtils.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/cdb-pg/src/backend/executor/execUtils.c b/cdb-pg/src/backend/executor/execUtils.c
+index 16331a2..d741e24 100644
+--- a/cdb-pg/src/backend/executor/execUtils.c
++++ b/cdb-pg/src/backend/executor/execUtils.c
+@@ -1895,6 +1895,7 @@ AssignGangs(QueryDesc *queryDesc, bool size1_writer)
+ 			{
+ 				if (!allocated_writer_gang && !queryDesc->extended_query)
+ 				{
++					Assert(j == 0);
+ 					if (size1_writer && !(IsTransactionBlock()))
+ 					{
+ 						inv.vec1gangs_primary_reader[i][j] = allocateGang(GANGTYPE_XNUM_WRITER, 1, i, queryDesc->portal_name);
+-- 
+1.8.2.1
+

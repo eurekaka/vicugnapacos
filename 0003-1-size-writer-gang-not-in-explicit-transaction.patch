@@ -1,0 +1,566 @@
+From 5a0e6a0341773eed633279a8a66da1e2bf182d6d Mon Sep 17 00:00:00 2001
+From: Kenan Yao <kyao@pivotal.io>
+Date: Tue, 14 Jul 2015 10:37:46 -0400
+Subject: [PATCH 3/6] 1-size writer gang not in explicit transaction.
+
+---
+ cdb-pg/src/backend/cdb/cdbdisp.c         |  13 ++-
+ cdb-pg/src/backend/cdb/cdbgang.c         | 183 ++++++++++++++++++++++++++++++-
+ cdb-pg/src/backend/commands/explain.c    |   1 +
+ cdb-pg/src/backend/executor/execMain.c   |  26 ++++-
+ cdb-pg/src/backend/executor/execUtils.c  |  36 ++++--
+ cdb-pg/src/backend/executor/nodeMotion.c |   3 +-
+ cdb-pg/src/include/cdb/cdbgang.h         |   7 +-
+ 7 files changed, 249 insertions(+), 20 deletions(-)
+
+diff --git a/cdb-pg/src/backend/cdb/cdbdisp.c b/cdb-pg/src/backend/cdb/cdbdisp.c
+index 9d36822..7fa1d3f 100644
+--- a/cdb-pg/src/backend/cdb/cdbdisp.c
++++ b/cdb-pg/src/backend/cdb/cdbdisp.c
+@@ -1292,8 +1292,9 @@ cdbdisp_dispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
+ 	PGresult  **resultSets = NULL;
+ 	
+ 	DispatchCommandDtxProtocolParms dtxProtocolParms;
+-	Gang	*primaryGang;
++	Gang	*primaryGang = NULL;
+ 	int		nsegdb = getgpsegmentCount();
++	int		direct_content_id = -1;
+ 	
+ 	elog((Debug_print_full_dtm ? LOG : DEBUG5), "cdbdisp_dispatchDtxProtocolCommand: %s for gid = %s, direct content #: %d",
+ 		 dtxProtocolCommandLoggingStr, gid, direct->directed_dispatch ? direct->content[0] : -1);
+@@ -1315,7 +1316,15 @@ cdbdisp_dispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
+ 	/*
+ 	 * Allocate a primary QE for every available segDB in the system.
+ 	 */
+-	primaryGang = allocateWriterGang();
++	if (direct->directed_dispatch)
++	{
++		direct_content_id = direct->content[0];
++		primaryGang = getXnumWriterGangByContentId(direct_content_id);
++	}
++	if (primaryGang == NULL)
++	{
++		primaryGang = allocateWriterGang();
++	}
+ 
+ 	Assert(primaryGang);
+ 
+diff --git a/cdb-pg/src/backend/cdb/cdbgang.c b/cdb-pg/src/backend/cdb/cdbgang.c
+index d7af82e..36bfb54 100644
+--- a/cdb-pg/src/backend/cdb/cdbgang.c
++++ b/cdb-pg/src/backend/cdb/cdbgang.c
+@@ -58,6 +58,7 @@ static Gang *createGang(GangType type, int gang_id, int size, int content, char
+ 
+ static void disconnectAndDestroyGang(Gang *gp);
+ static void disconnectAndDestroyAllReaderGangs(bool destroyAllocated);
++static void disconnectAndDestroyCorrespondingXnumReaderGangs(Gang *writer, bool destroyAllocated);
+ 
+ static Gang *buildGangDefinition(GangType type, int gang_id, int size, int content, char *portal_name);
+ 
+@@ -739,7 +740,7 @@ buildGangDefinition(GangType type, int gang_id, int size, int content, char *por
+ 	{
+ 		p = &cdb_component_dbs->segment_db_info[i];
+ 
+-		if (type == GANGTYPE_XNUM_READER) /* handle singleton readers separately */
++		if (type == GANGTYPE_XNUM_READER || type == GANGTYPE_XNUM_WRITER) /* handle singleton readers/writers separately */
+ 		{
+ 			Assert(size == 1);
+ 			if (content != p->segindex || !SEGMENT_IS_ACTIVE_PRIMARY(p))
+@@ -1103,10 +1104,10 @@ thread_DoConnect(void *arg)
+ 		 * early enough now some locks are taken before command line options
+ 		 * are recognized.
+ 		 */
+-		build_gpqeid_params(&buffer, pParms->type == GANGTYPE_PRIMARY_WRITER);
++		build_gpqeid_params(&buffer, pParms->type == GANGTYPE_PRIMARY_WRITER || pParms->type == GANGTYPE_XNUM_WRITER);
+ 
+ 		err = addOptions(&buffer,
+-						 (pParms->type == GANGTYPE_PRIMARY_WRITER),
++						 (pParms->type == GANGTYPE_PRIMARY_WRITER || pParms->type == GANGTYPE_XNUM_WRITER),
+ 						 q->segindex, pParms->i_am_superuser);
+ 
+ 		if (err <= 0)
+@@ -1307,6 +1308,7 @@ static List *availableReaderGangsN = NIL;
+ static List *allocatedReaderGangs1 = NIL;
+ static List *availableReaderGangs1 = NIL;
+ static Gang *primaryWriterGang = NULL;
++static Gang **availableXnumWriterGangs = NULL;
+ 
+ List *
+ getAllReaderGangs()
+@@ -1452,6 +1454,73 @@ allocateGang(GangType type, int size, int content, char *portal_name)
+ 			}
+ 			break;
+ 
++			case GANGTYPE_XNUM_WRITER:
++			{
++				Assert(size == 1);
++				
++				if (primaryWriterGang != NULL)
++				{
++					Assert(availableXnumWriterGangs == NULL);
++					gp = primaryWriterGang;
++				}
++				else
++				{
++					if (availableXnumWriterGangs != NULL)		/* There are gangs
++															 * already created */
++					{
++						gp = availableXnumWriterGangs[content];
++					}
++					else
++					{
++						availableXnumWriterGangs = palloc0(sizeof(Gang *) * getgpsegmentCount());
++					}
++				}
++
++				if (gp != NULL)
++				{
++					Assert((gp->type == GANGTYPE_XNUM_WRITER && gp->size == 1) || gp->type == GANGTYPE_PRIMARY_WRITER);
++					Assert(gp->allocated == false);
++					/*
++					 * make sure no memory is still allocated for previous
++					 * portal name that this gang belonged to
++					 */
++					if (gp->portal_name)
++						pfree(gp->portal_name);
++
++					/* let the gang know which portal it is being assigned to */
++					gp->portal_name = (portal_name ? pstrdup(portal_name) : (char *) NULL);
++				}
++				else
++					/*
++					 * no pre-created gang exists
++					 */
++				{
++					// disconnectAndDestroyGang(primaryWriterGang);
++					for (int attempts = 0; (attempts < gp_gang_creation_retry_count && gp == NULL); attempts++)
++					{
++						gp = createGang(type, gang_id_counter++, size, content, portal_name);
++						if (gp_log_gang >= GPVARS_VERBOSITY_DEBUG
++								&& gp == NULL)
++						{
++							elog(LOG, "Could not create 1-size writer gang. Retry count = %d", (attempts + 1));
++						}
++					}
++				}
++
++				if (!gp)
++				{
++					ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
++							errmsg("segworker group creation failed"),
++							errhint("server log may have more detailed error message")));
++				}
++				if (gp->type == GANGTYPE_XNUM_WRITER)
++				{
++					Assert(availableXnumWriterGangs != NULL);
++					availableXnumWriterGangs[content] = gp;
++				}
++			}
++			break;
++
+ 		case GANGTYPE_ENTRYDB_READER:
+ 		case GANGTYPE_XNUM_READER:
+ 			{
+@@ -1595,6 +1664,16 @@ allocateWriterGang()
+ 
+ 		nsegdb = getgpsegmentCount();
+ 
++		if (availableXnumWriterGangs != NULL)
++		{
++			for (int i = 0; i < nsegdb; ++i)
++			{
++				disconnectAndDestroyGang(availableXnumWriterGangs[i]);
++				availableXnumWriterGangs[i] = NULL;
++			}
++			availableXnumWriterGangs = NULL;
++		}
++
+ 		for (int attempts = 0; (attempts < gp_gang_creation_retry_count && writer_gang == NULL); attempts++)
+ 		{
+ 			writer_gang =
+@@ -2368,6 +2447,11 @@ disconnectAndDestroyGang(Gang *gp)
+ 		resetSessionForPrimaryGangLoss();
+ 	}
+ 
++	if (gp->type == GANGTYPE_XNUM_WRITER)
++	{
++		disconnectAndDestroyCorrespondingXnumReaderGangs(gp, true);
++	}
++
+ 	/*
+ 	 * Discard the segment array and the cluster descriptor
+ 	 */
+@@ -2434,6 +2518,21 @@ freeGangsForPortal(char *portal_name)
+ 
+ 			return;
+ 		}
++
++		/* noly when primaryWriterGang is NULL can take effect here. */
++		if (availableXnumWriterGangs != NULL)
++		{
++			for(int i = 0; i < getgpsegmentCount(); ++i)
++			{
++				if (!cleanupGang(availableXnumWriterGangs[i]))
++				{
++					availableXnumWriterGangs[i] = NULL; /* cleanupGang would call disconnectAndDestroyGang(), which would
++														 * call disconnectAndDestroyCorrespondingXnumReaderGangs()*/
++					elog(ERROR, "could not temporarily connect to one or more segments");
++					return;
++				}
++			}
++		}
+ 	}
+ 
+ 	if (GangContext)
+@@ -2619,6 +2718,53 @@ disconnectAndDestroyAllReaderGangs(bool destroyAllocated)
+ 	availableReaderGangs1 = NIL;
+ }
+ 
++/*
++ * disconnectAndDestroyCorrespondingXnumReaderGangs
++ *
++ * Here we destroy all xnum reader gangs which are on the same segment with the param xnum writer gang.
++ *
++ * If the parameter destroyAllocated is true, then destroy allocated as well as
++ * available gangs.
++ */
++static void
++disconnectAndDestroyCorrespondingXnumReaderGangs(Gang *writer, bool destroyAllocated)
++{
++	Assert(writer->type == GANGTYPE_XNUM_WRITER);
++	Gang		*gp;
++	ListCell	*lc = NULL, *prev = NULL;
++
++	if (allocatedReaderGangs1 != NIL && destroyAllocated)
++	{
++		foreach(lc, allocatedReaderGangs1)
++		{
++			gp = (Gang *) lfirst(lc);
++			Assert(gp->type == GANGTYPE_XNUM_READER && gp->size == 1);
++			if (gp->db_descriptors->segindex != writer->db_descriptors->segindex)
++			{
++				prev = lc;
++				continue;
++			}
++			disconnectAndDestroyGang(gp);
++			allocatedReaderGangs1 = list_delete_cell(allocatedReaderGangs1, lc, prev);
++		}
++	}
++	if (availableReaderGangs1 != NIL)
++	{
++		prev = NULL;
++		foreach(lc, availableReaderGangs1)
++		{
++			gp = (Gang *) lfirst(lc);
++			Assert(gp->type == GANGTYPE_XNUM_READER && gp->size == 1);
++			if (gp->db_descriptors->segindex != writer->db_descriptors->segindex)
++			{
++				prev = lc;
++				continue;
++			}
++			disconnectAndDestroyGang(gp);
++			availableReaderGangs1 = list_delete_cell(availableReaderGangs1, lc, prev);
++		}
++	}
++}
+ 
+ /*
+  * Drop any temporary tables associated with the current session and
+@@ -2754,6 +2900,17 @@ disconnectAndDestroyAllGangs(void)
+ 	disconnectAndDestroyGang(primaryWriterGang);
+ 	primaryWriterGang = NULL;
+ 
++	int i = 0;
++	if (availableXnumWriterGangs != NULL)
++	{
++		for (i = 0; i < getgpsegmentCount(); ++i)
++		{
++			disconnectAndDestroyGang(availableXnumWriterGangs[i]);
++			availableXnumWriterGangs[i] = NULL;
++		}
++		availableXnumWriterGangs = NULL;
++	}
++
+ 	if (gp_log_gang >= GPVARS_VERBOSITY_DEBUG)
+ 		elog(DEBUG3, "disconnectAndDestroyAllGangs done");
+ }
+@@ -2823,6 +2980,17 @@ getComponentDatabases(void)
+ bool
+ gangsExist(void)
+ {
++	if (availableXnumWriterGangs != NULL)
++	{
++		for(int i = 0; i < getgpsegmentCount(); ++i)
++		{
++			if(availableXnumWriterGangs[i] != NULL)
++			{
++				return true;
++			}
++		}
++	}
++
+ 	return (primaryWriterGang != NULL ||
+ 			allocatedReaderGangsN != NIL ||
+ 			availableReaderGangsN != NIL ||
+@@ -2941,3 +3109,12 @@ AssertSliceTableIsValid(SliceTable *st, struct PlannedStmt *pstmt)
+ }
+ 
+ #endif
++
++Gang *
++getXnumWriterGangByContentId(int content_id)
++{
++	Assert(content_id >= 0 && content_id < getgpsegmentCount());
++	if (availableXnumWriterGangs == NULL)
++		return NULL;
++	return availableXnumWriterGangs[content_id];
++}
+diff --git a/cdb-pg/src/backend/commands/explain.c b/cdb-pg/src/backend/commands/explain.c
+index b0b0add..c7618d1 100644
+--- a/cdb-pg/src/backend/commands/explain.c
++++ b/cdb-pg/src/backend/commands/explain.c
+@@ -864,6 +864,7 @@ appendGangAndDirectDispatchInfo(StringInfo str, PlanState *planstate, int sliceI
+ 		case GANGTYPE_PRIMARY_WRITER:
+ 		case GANGTYPE_PRIMARY_READER:
+ 		case GANGTYPE_XNUM_READER:
++		case GANGTYPE_XNUM_WRITER:
+ 		{
+ 			int numSegments;
+ 			appendStringInfo(str, "  (slice%d;", sliceId);
+diff --git a/cdb-pg/src/backend/executor/execMain.c b/cdb-pg/src/backend/executor/execMain.c
+index 4d28ed4..eb9f88a 100644
+--- a/cdb-pg/src/backend/executor/execMain.c
++++ b/cdb-pg/src/backend/executor/execMain.c
+@@ -163,6 +163,8 @@ typedef struct CopyDirectDispatchToSliceContext
+ {
+ 	plan_tree_base_prefix	base; /* Required prefix for plan_tree_walker/mutator */
+ 	EState					*estate; /* EState instance */
++	int						content_id;
++	bool					size1_writer;
+ } CopyDirectDispatchToSliceContext;
+ 
+ static bool CopyDirectDispatchFromPlanToSliceTableWalker( Node *node, CopyDirectDispatchToSliceContext *context);
+@@ -180,6 +182,18 @@ CopyDirectDispatchToSlice( Plan *ddPlan, int sliceId, CopyDirectDispatchToSliceC
+ 	{
+ 		slice->directDispatch.isDirectDispatch = true;
+ 		slice->directDispatch.contentIds = list_copy(ddPlan->directDispatch.contentIds);
++		if (sliceId == 0)
++		{
++			context->content_id = linitial_int(slice->directDispatch.contentIds);
++		}
++		else if (context->size1_writer && context->content_id != linitial_int(slice->directDispatch.contentIds))
++		{
++			context->size1_writer = false;
++		}
++	}
++	else
++	{
++		context->size1_writer = false;
+ 	}
+ }
+ 
+@@ -208,13 +222,16 @@ CopyDirectDispatchFromPlanToSliceTableWalker( Node *node, CopyDirectDispatchToSl
+ }
+ 
+ static void
+-CopyDirectDispatchFromPlanToSliceTable(PlannedStmt *stmt, EState *estate)
++CopyDirectDispatchFromPlanToSliceTable(PlannedStmt *stmt, EState *estate, bool *size1_writer)
+ {
+ 	CopyDirectDispatchToSliceContext context;
+ 	exec_init_plan_tree_base(&context.base, stmt);
+ 	context.estate = estate;
++	context.size1_writer = true;
++	context.content_id = -2;
+ 	CopyDirectDispatchToSlice( stmt->planTree, 0, &context);
+ 	CopyDirectDispatchFromPlanToSliceTableWalker((Node *) stmt->planTree, &context);
++	*size1_writer = context.size1_writer;
+ }
+ 
+ /* ----------------------------------------------------------------
+@@ -247,6 +264,7 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
+ 	GpExecIdentity exec_identity;
+ 	bool		shouldDispatch;
+ 	bool		needDtxTwoPhase;
++	bool		size1_writer = false;
+ 
+ 	/* sanity checks: queryDesc must not be started already */
+ 	Assert(queryDesc != NULL);
+@@ -396,7 +414,7 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
+ 			 **/
+ 			if (gp_enable_direct_dispatch)
+ 			{
+-				CopyDirectDispatchFromPlanToSliceTable(queryDesc->plannedstmt, estate );
++				CopyDirectDispatchFromPlanToSliceTable(queryDesc->plannedstmt, estate, &size1_writer);
+ 			}
+ 
+ 			/* Pass EXPLAIN ANALYZE flag to qExecs. */
+@@ -534,7 +552,7 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
+ 				queryDesc->plannedstmt->planTree->dispatch == DISPATCH_PARALLEL)
+ 			{
+ 				/* Assign gang descriptions to the root slices of the slice forest. */
+-				InitRootSlices(queryDesc);
++				InitRootSlices(queryDesc, size1_writer);
+ 
+ 				if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+ 				{
+@@ -548,7 +566,7 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
+ 					 * On return, gangs have been allocated and CDBProcess lists have
+ 					 * been filled in in the slice table.)
+ 					 */
+-					AssignGangs(queryDesc, gp_singleton_segindex);
++					AssignGangs(queryDesc, size1_writer);
+ 				}
+ 
+ 			}
+diff --git a/cdb-pg/src/backend/executor/execUtils.c b/cdb-pg/src/backend/executor/execUtils.c
+index 0bab6b2..16331a2 100644
+--- a/cdb-pg/src/backend/executor/execUtils.c
++++ b/cdb-pg/src/backend/executor/execUtils.c
+@@ -1661,6 +1661,7 @@ sliceCalculateNumSendingProcesses(Slice *slice, int numSegmentsInCluster)
+ 			return 1; /* on master */
+ 
+ 		case GANGTYPE_PRIMARY_WRITER:
++		case GANGTYPE_XNUM_WRITER:
+ 			return 0; /* writers don't send */
+ 
+ 		case GANGTYPE_PRIMARY_READER:
+@@ -1697,7 +1698,7 @@ sliceCalculateNumSendingProcesses(Slice *slice, int numSegmentsInCluster)
+  *	  (gangType, gangSize) =  <GANGTYPE_PRIMARY_WRITER, N>
+  */
+ void
+-InitRootSlices(QueryDesc *queryDesc)
++InitRootSlices(QueryDesc *queryDesc, bool size1_writer)
+ {
+ 	EState	   *estate = queryDesc->estate;
+ 	SliceTable *sliceTable = estate->es_sliceTable;
+@@ -1736,8 +1737,17 @@ InitRootSlices(QueryDesc *queryDesc)
+ 					Oid reloid = getrelid(idx, queryDesc->plannedstmt->rtable);
+ 					if (!isMasterOnly(reloid))
+ 					{
+-						slice->gangType = GANGTYPE_PRIMARY_WRITER;
+-						slice->gangSize = getgpsegmentCount();
++						if (size1_writer &&
++							slice->directDispatch.isDirectDispatch)
++						{
++							slice->gangType = GANGTYPE_XNUM_WRITER;
++							slice->gangSize = 1;
++						}
++						else
++						{
++							slice->gangType = GANGTYPE_PRIMARY_WRITER;
++							slice->gangSize = getgpsegmentCount();
++						}
+ 						slice->numGangMembersToBeActive = sliceCalculateNumSendingProcesses(slice, getgpsegmentCount());
+ 			        }
+ 			        /* else: result relation is master-only, so top slice should run on the QD and not be dispatched */
+@@ -1809,7 +1819,7 @@ static void AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceR
+  * slice in the slice table.
+  */
+ void
+-AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
++AssignGangs(QueryDesc *queryDesc, bool size1_writer)
+ {
+ 	EState	   *estate = queryDesc->estate;
+ 	SliceTable *sliceTable = estate->es_sliceTable;
+@@ -1885,7 +1895,15 @@ AssignGangs(QueryDesc *queryDesc, int utility_segment_index)
+ 			{
+ 				if (!allocated_writer_gang && !queryDesc->extended_query)
+ 				{
+-					inv.vec1gangs_primary_reader[i][j] = allocateWriterGang();
++					if (size1_writer && !(IsTransactionBlock()))
++					{
++						inv.vec1gangs_primary_reader[i][j] = allocateGang(GANGTYPE_XNUM_WRITER, 1, i, queryDesc->portal_name);
++					}
++					else
++					{
++						inv.vec1gangs_primary_reader[i][j] = allocateWriterGang();
++					}
++					allocated_writer_gang = true;
+ 				}
+ 				else
+ 				{
+@@ -2007,12 +2025,15 @@ InventorySliceTree(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+ 			Assert(slice->gangSize == getgpsegmentCount());
+ 			req->numNgangs++;
+ 			break;
++		case GANGTYPE_XNUM_WRITER:
++			/* means that size1_writer is set to true */
+ 		case GANGTYPE_XNUM_READER:
+ 			{
+ 				req->has_xnum_reader_gang = true;
+ 				Assert(slice->gangSize == 1); /* currently, direct dispatch only supports one segdb dispatch */
+ 				int content_id = -1;
+ 				if (slice->directDispatch.isDirectDispatch)
++					/* GANGTYPE_XNUM_WRITER must go this path */
+ 				{
+ 					Assert(list_length(slice->directDispatch.contentIds) == 1);
+ 					content_id = linitial_int(slice->directDispatch.contentIds);
+@@ -2107,10 +2128,11 @@ AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+                                                         &slice->directDispatch);
+ 			Assert(sliceCalculateNumSendingProcesses(slice, getgpsegmentCount()) == countNonNullValues(slice->primaryProcesses));
+ 			break;
++		case GANGTYPE_XNUM_WRITER:
+ 		case GANGTYPE_XNUM_READER:
+ 			Assert(slice->gangSize == 1);
+ 			int content_id = -1;
+-			if (slice->directDispatch.isDirectDispatch)
++			if (slice->directDispatch.isDirectDispatch) /* this check is for query like INSERT INTO tbl VALUES(1,1),(2,2) */
+ 			{
+ 				Assert(list_length(slice->directDispatch.contentIds) == 1);
+ 				content_id = linitial_int(slice->directDispatch.contentIds);
+@@ -2127,7 +2149,7 @@ AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+ 			slice->primaryProcesses = getCdbProcessList(slice->primaryGang,
+ 														slice->sliceIndex,
+ 														&slice->directDispatch);
+-			Assert(sliceCalculateNumSendingProcesses(slice, getgpsegmentCount()) == 1 && countNonNullValues(slice->primaryProcesses) == 1);
++			Assert(countNonNullValues(slice->primaryProcesses) == 1);
+ 			break;
+ 	}
+ 
+diff --git a/cdb-pg/src/backend/executor/nodeMotion.c b/cdb-pg/src/backend/executor/nodeMotion.c
+index f3a4401..7a78374 100644
+--- a/cdb-pg/src/backend/executor/nodeMotion.c
++++ b/cdb-pg/src/backend/executor/nodeMotion.c
+@@ -1033,7 +1033,8 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
+ 				Assert(node->outputSegIdx[0] >= 0
+ 					   ? (recvSlice->gangType == GANGTYPE_PRIMARY_READER || 
+ 						  recvSlice->gangType == GANGTYPE_ENTRYDB_READER ||
+-						  recvSlice->gangType == GANGTYPE_XNUM_READER)
++						  recvSlice->gangType == GANGTYPE_XNUM_READER ||
++						  recvSlice->gangType == GANGTYPE_XNUM_WRITER)
+ 					   : recvSlice->gangType == GANGTYPE_ENTRYDB_READER);
+ 			}
+ 		}
+diff --git a/cdb-pg/src/include/cdb/cdbgang.h b/cdb-pg/src/include/cdb/cdbgang.h
+index 65ede5c..30163ff 100644
+--- a/cdb-pg/src/include/cdb/cdbgang.h
++++ b/cdb-pg/src/include/cdb/cdbgang.h
+@@ -26,6 +26,7 @@ typedef enum GangType
+ 	GANGTYPE_ENTRYDB_READER,    /* a 1-gang with read access to the entry db */
+ 	GANGTYPE_PRIMARY_READER,    /* a 1-gang or N-gang to read the segment dbs */
+ 	GANGTYPE_XNUM_READER,
++	GANGTYPE_XNUM_WRITER,
+ 	GANGTYPE_PRIMARY_WRITER    /* the N-gang that can update the segment dbs */
+ } GangType;
+ 
+@@ -285,8 +286,8 @@ extern bool sliceRunsOnQD(Slice *slice);
+ extern bool sliceRunsOnQE(Slice *slice);
+ extern int sliceCalculateNumSendingProcesses(Slice *slice, int numSegmentsInCluster);
+ 
+-extern void InitRootSlices(QueryDesc *queryDesc);
+-extern void AssignGangs(QueryDesc *queryDesc, int utility_segment_index);
++extern void InitRootSlices(QueryDesc *queryDesc, bool size1_writer);
++extern void AssignGangs(QueryDesc *queryDesc, bool size1_writer);
+ extern void ReleaseGangs(QueryDesc *queryDesc);
+ 
+ #ifdef USE_ASSERT_CHECKING
+@@ -294,5 +295,5 @@ struct PlannedStmt;
+ 
+ extern void AssertSliceTableIsValid(SliceTable *st, struct PlannedStmt *pstmt);
+ #endif
+-
++extern Gang *getXnumWriterGangByContentId(int content_id);
+ #endif   /* _CDBGANG_H_ */
+-- 
+1.8.2.1
+
